@@ -19,6 +19,7 @@ Built and verified against a GL.iNet RM10 running kvmd 4.82 (GL fork). Other GLK
 | `GLKVM_PASSWORD` | unset | Web UI password, required |
 | `GLKVM_BASE` | `https://<GLKVM_HOST>` | Full base URL override |
 | `GLKVM_ALLOW_MSD` | unset | Set to `1`/`true`/`yes` to enable the `msd_*` tools |
+| `GLKVM_ARTIFACT_DIR` | `~/.local/share/glkvm-mcp/artifacts` | Private local directory for frames explicitly saved by `observe_screen` |
 
 Setup and registration in Claude Code (`.mcp.json`):
 
@@ -39,18 +40,32 @@ Setup and registration in Claude Code (`.mcp.json`):
 Screen:
 
 - `screenshot` - live frame as an image, content-sized to taste
+- `observe_screen` - fresh capture summarized as bounded OCR text, with native-pixel boxes, confidence estimates, capture receipt time, frame hash, and OCR cache metadata; it returns one JSON text block and no image/resource blocks. `save_frame=true` stores a unique read-only PNG locally and returns its absolute path, byte count, hash, and provenance.
 - `screen_elements` - OCR of the current frame into a JSON tree (blocks, lines, words, optional letters) with pixel bounding boxes
 - `snapshot_info` - display resolution and a frame hash to test freshness
 
 Input (coordinates are target-screen pixels):
 
 - `click_at`, `click_text`, `move_mouse`, `mouse_relative`, `drag`, `scroll`
-- `key`, `key_combo`, `type_text` - keys are KeyboardEvent.code names, so `MetaLeft` opens the target's Start menu; `type_text` sends arbitrary Unicode
+- `key`, `key_combo`, `type_text` - keys are KeyboardEvent.code names, so `MetaLeft` opens the target's Start menu; `type_text` sends arbitrary Unicode and supports `echo_text=false` to omit the typed value from its result
 
 State and safety:
 
 - `human_activity` - warns when input the tool did not produce is happening (keyboard/mouse inactivity counter, or screen motion as fallback)
+- `refresh_auth` - forces a new KVM login and returns only success or a sanitized error
 - `kvmd_api` - raw GET/POST passthrough for anything the driver does not wrap
+
+`observe_screen` always requests a new KVM frame, even when its OCR result is
+reused for identical pixels. Its UTC capture time is the local server's receipt
+time: kvmd does not provide a device capture timestamp or verified physical
+target identity. OCR confidence is an estimate, and low-confidence text may be
+wrong. `max_lines` and `max_chars` bound the returned OCR payload and report any
+truncation. Saved PNGs use unique names, a private directory, and read-only file
+permissions; they remain local to the MCP server host. `echo_text=false` only
+omits typed text from the tool result. MCP clients or server logs may still
+record the input argument, so `type_text` is not a secret-safe channel. An
+existing artifact directory must already be owner-only and writable; saving
+refuses a permissive directory without changing its permissions.
 
 File transfer (opt-in via `GLKVM_ALLOW_MSD=1`, see below):
 
