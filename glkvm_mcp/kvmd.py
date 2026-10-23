@@ -26,7 +26,7 @@ import json
 import os
 import ssl
 import time
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 import httpx
 from PIL import Image as PILImage
@@ -41,10 +41,19 @@ _TOKEN_FILE = os.path.expanduser(f"~/.cache/glkvm-mcp/{HOST}.token.json")
 # Empirical GL absolute-mouse mapping constants (fractions of frame size).
 _X_OFF_FRAC = 0.05
 _X_SPAN_FRAC = 0.90
+_DEFAULT_OPERATION_TIMEOUT_S = 30.0
+_MAX_OPERATION_TIMEOUT_S = 120.0
+_CONNECT_TIMEOUT_S = 5.0
+_MAX_TYPE_TEXT_CHARS = 9_000
+_MAX_TYPE_TEXT_OPERATION_TIMEOUT_S = 300.0
+_MAX_TYPE_TEXT_DELAY_S = 0.1
 
 
 def v_from_px_x(x: float, w: int) -> int:
-    return max(-32768, min(32767, round((x - _X_OFF_FRAC * w) * 65535 / (_X_SPAN_FRAC * w)) - 32768))
+    return max(
+        -32768,
+        min(32767, round((x - _X_OFF_FRAC * w) * 65535 / (_X_SPAN_FRAC * w)) - 32768),
+    )
 
 
 def v_from_px_y(y: float, h: int) -> int:
@@ -58,7 +67,39 @@ def px_from_v(vx: int, vy: int, w: int, h: int) -> tuple[float, float]:
 
 
 class GlkvmError(RuntimeError):
-    pass
+    """Safe-to-classify driver failure; messages never include device payloads."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "device_error",
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+
+
+class InputOutcomeUnknown(GlkvmError):
+    """An input request may have reached the target, so automatic retry is unsafe."""
+
+    def __init__(self, *, category: str = "timeout") -> None:
+        super().__init__("typing request outcome is uncertain", category=category)
+
+
+def safe_error_details(exc: BaseException) -> dict[str, Any]:
+    """Return a sanitized failure category and optional HTTP status for tool output."""
+    if isinstance(exc, GlkvmError):
+        result: dict[str, Any] = {"category": exc.category}
+        if exc.status_code is not None:
+            result["http_status"] = exc.status_code
+        return result
+    if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+        return {"category": "timeout"}
+    if isinstance(exc, httpx.TransportError):
+        return {"category": "network"}
+    return {"category": "internal"}
 
 
 class GlkvmClient:
@@ -79,13 +120,20 @@ class GlkvmClient:
     async def client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
             self._http = httpx.AsyncClient(
-                base_url=BASE, verify=self._ssl, timeout=httpx.Timeout(20.0),
+                base_url=BASE,
+                verify=self._ssl,
+                timeout=httpx.Timeout(
+                    connect=_CONNECT_TIMEOUT_S,
+                    read=_DEFAULT_OPERATION_TIMEOUT_S,
+                    write=_DEFAULT_OPERATION_TIMEOUT_S,
+                    pool=_CONNECT_TIMEOUT_S,
+                ),
             )
         return self._http
 
     async def login(self, force: bool = False) -> str:
         if not PASSWORD:
-            raise GlkvmError("set GLKVM_PASSWORD (device web-admin password) in the server env")
+            raise GlkvmError("KVM password is not configured", category="configuration")
         async with self._login_lock:
             if not force and self._token:
                 return self._token
@@ -95,11 +143,39 @@ class GlkvmClient:
                     self._token = tok
                     return tok
             http = await self.client()
-            r = await http.post("/api/auth/login", data={"user": USER, "passwd": PASSWORD})
-            r.raise_for_status()
+            try:
+                async with asyncio.timeout(_DEFAULT_OPERATION_TIMEOUT_S):
+                    r = await http.post(
+                        "/api/auth/login",
+                        data={"user": USER, "passwd": PASSWORD},
+                        timeout=httpx.Timeout(
+                            connect=_CONNECT_TIMEOUT_S,
+                            read=_DEFAULT_OPERATION_TIMEOUT_S,
+                            write=_DEFAULT_OPERATION_TIMEOUT_S,
+                            pool=_CONNECT_TIMEOUT_S,
+                        ),
+                    )
+            except (httpx.TimeoutException, TimeoutError) as exc:
+                raise GlkvmError(
+                    "KVM authentication timed out", category="timeout"
+                ) from exc
+            except httpx.TransportError as exc:
+                raise GlkvmError(
+                    "KVM authentication connection failed", category="network"
+                ) from exc
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise GlkvmError(
+                    "KVM authentication was rejected",
+                    category="authentication",
+                    status_code=exc.response.status_code,
+                ) from None
             j = r.json()
             if not j.get("ok"):
-                raise GlkvmError(f"login failed: {j.get('message') or j}")
+                raise GlkvmError(
+                    "KVM authentication was rejected", category="authentication"
+                )
             self._token = j["result"]["token"]
             self._save_token_file(self._token)
             return self._token
@@ -134,6 +210,7 @@ class GlkvmClient:
         data: dict[str, Any] | None = None,
         raw_content: bytes | None = None,
         _retry: bool = True,
+        timeout_s: float | None = None,
     ) -> httpx.Response:
         tok = await self.login()
         http = await self.client()
@@ -144,36 +221,101 @@ class GlkvmClient:
             kw["data"] = data
         if raw_content is not None:
             kw["content"] = raw_content
-        r = await http.request(method, path, params=q, headers={"token": tok}, **kw)
-        if r.status_code == 401 and _retry:
+        operation_timeout = min(
+            _MAX_OPERATION_TIMEOUT_S,
+            max(
+                0.1,
+                timeout_s if timeout_s is not None else _DEFAULT_OPERATION_TIMEOUT_S,
+            ),
+        )
+        request_timeout = httpx.Timeout(
+            connect=min(_CONNECT_TIMEOUT_S, operation_timeout),
+            read=operation_timeout,
+            write=operation_timeout,
+            pool=min(_CONNECT_TIMEOUT_S, operation_timeout),
+        )
+        try:
+            async with asyncio.timeout(operation_timeout):
+                r = await http.request(
+                    method,
+                    path,
+                    params=q,
+                    headers={"token": tok},
+                    timeout=request_timeout,
+                    **kw,
+                )
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            raise GlkvmError("KVM request timed out", category="timeout") from exc
+        except httpx.TransportError as exc:
+            raise GlkvmError("KVM connection failed", category="network") from exc
+        # Only repeat an idempotent read. A POST can represent a HID action and
+        # may have reached kvmd even if the response indicates stale auth.
+        if r.status_code == 401 and _retry and method.upper() == "GET":
             await self.login(force=True)
-            return await self.request(method, path, query=query, data=data,
-                                      raw_content=raw_content, _retry=False)
-        if r.status_code == 403 and _retry and "ForbiddenError" in r.text:
+            return await self.request(
+                method,
+                path,
+                query=query,
+                data=data,
+                raw_content=raw_content,
+                _retry=False,
+                timeout_s=timeout_s,
+            )
+        if (
+            r.status_code == 403
+            and _retry
+            and method.upper() == "GET"
+            and "ForbiddenError" in r.text
+        ):
             # GL fork: an unknown but format-valid token returns 403
             # ForbiddenError (kvmd restart invalidates the cached token;
             # genuinely denied permissions come back 401 or 400 instead).
             await self.login(force=True)
-            return await self.request(method, path, query=query, data=data,
-                                      raw_content=raw_content, _retry=False)
+            return await self.request(
+                method,
+                path,
+                query=query,
+                data=data,
+                raw_content=raw_content,
+                _retry=False,
+                timeout_s=timeout_s,
+            )
         if r.status_code >= 400:
-            snippet = r.text[:200]
-            raise GlkvmError(f"{method} {path} -> {r.status_code}: {snippet}")
+            category = (
+                "authentication" if r.status_code in (401, 403) else "request_rejected"
+            )
+            raise GlkvmError(
+                "KVM request was rejected",
+                category=category,
+                status_code=r.status_code,
+            )
         return r
 
     async def get_json(self, path: str, *, query: dict[str, Any] | None = None) -> Any:
         r = await self.request("GET", path, query=query)
         return r.json()
 
-    async def post_ok(self, path: str, *, query: dict[str, Any] | None = None,
-                      raw_content: bytes | None = None) -> dict:
-        r = await self.request("POST", path, query=query, raw_content=raw_content)
+    async def post_ok(
+        self,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        raw_content: bytes | None = None,
+        timeout_s: float | None = None,
+    ) -> dict:
+        r = await self.request(
+            "POST", path, query=query, raw_content=raw_content, timeout_s=timeout_s
+        )
         try:
             j = r.json()
         except Exception:
             j = {"ok": r.is_success}
         if isinstance(j, dict) and j.get("ok") is False:
-            raise GlkvmError(f"{path}: {j.get('message') or j}")
+            raise GlkvmError(
+                "KVM rejected the operation",
+                category="device_rejected",
+                status_code=r.status_code,
+            )
         return j if isinstance(j, dict) else {"ok": True}
 
     # -- keyboard ----------------------------------------------------------
@@ -207,45 +349,113 @@ class GlkvmClient:
         """Unicode typing via kvmd's server-side keysym printer."""
         if not text:
             return
-        chunks = [text[i:i + 900] for i in range(0, len(text), 900)]
-        for c in chunks:
-            await self.post_ok("/api/hid/print", query={"delay": delay}, raw_content=c.encode("utf-8"))
+        if len(text) > _MAX_TYPE_TEXT_CHARS:
+            raise GlkvmError(
+                "typing request exceeds the character limit", category="validation"
+            )
+        if not 0.0 <= delay <= _MAX_TYPE_TEXT_DELAY_S:
+            raise GlkvmError("typing delay is out of range", category="validation")
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GlkvmError(
+                "typing request contains invalid Unicode", category="validation"
+            ) from None
+
+        # Estimate an upper bound before sending any HID input. The 5ms floor
+        # accounts for kvmd processing even when per-key delay is zero.
+        effective_delay = max(delay, 0.005)
+        chunk_size = min(
+            900,
+            max(1, int((_MAX_OPERATION_TIMEOUT_S - 5.0) / (effective_delay * 2.5))),
+        )
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+        estimated_total = 15.0 + len(text) * effective_delay * 2.5 + len(chunks) * 5.0
+        if estimated_total > _MAX_TYPE_TEXT_OPERATION_TIMEOUT_S:
+            raise GlkvmError(
+                "typing request exceeds the operation time limit", category="validation"
+            )
+
+        # Fail on missing/invalid authentication before classifying a print
+        # request as uncertain. Input requests themselves are never retried.
+        await self.login()
+        try:
+            async with asyncio.timeout(estimated_total):
+                for c in chunks:
+                    timeout_s = min(
+                        _MAX_OPERATION_TIMEOUT_S,
+                        max(
+                            _DEFAULT_OPERATION_TIMEOUT_S,
+                            5.0 + len(c) * effective_delay * 2.5,
+                        ),
+                    )
+                    try:
+                        await self.post_ok(
+                            "/api/hid/print",
+                            query={"delay": delay},
+                            raw_content=c.encode("utf-8"),
+                            timeout_s=timeout_s,
+                        )
+                    except GlkvmError as exc:
+                        raise InputOutcomeUnknown(category=exc.category) from exc
+        except TimeoutError as exc:
+            raise InputOutcomeUnknown(category="timeout") from exc
         self.last_input_ts = time.time()
 
     # -- mouse ---------------------------------------------------------------
 
     async def mouse_move(self, x: float, y: float) -> tuple[int, int]:
         vx, vy = v_from_px_x(x, self._w), v_from_px_y(y, self._h)
-        await self.post_ok("/api/hid/events/send_mouse_move",
-                           query={"to_x": vx, "to_y": vy})
+        await self.post_ok(
+            "/api/hid/events/send_mouse_move", query={"to_x": vx, "to_y": vy}
+        )
         self.last_input_ts = time.time()
         return (vx, vy)
 
     async def mouse_button(self, button: str, state: bool) -> None:
-        await self.post_ok("/api/hid/events/send_mouse_button",
-                           query={"button": button, "state": 1 if state else 0})
+        await self.post_ok(
+            "/api/hid/events/send_mouse_button",
+            query={"button": button, "state": 1 if state else 0},
+        )
         self.last_input_ts = time.time()
 
-    async def mouse_click(self, x: float | None = None, y: float | None = None,
-                          button: str = "left") -> None:
-        if x is not None or y is not None:
+    async def mouse_click(
+        self, x: float | None = None, y: float | None = None, button: str = "left"
+    ) -> None:
+        if (x is None) != (y is None):
+            raise GlkvmError(
+                "mouse click coordinates must be provided together",
+                category="validation",
+            )
+        if x is not None and y is not None:
             await self.mouse_move(x, y)
             await asyncio.sleep(0.02)
-        await self.post_ok("/api/hid/events/send_mouse_button", query={"button": button})
+        await self.post_ok(
+            "/api/hid/events/send_mouse_button", query={"button": button}
+        )
         self.last_input_ts = time.time()
 
     async def scroll(self, notches: int = 3, direction: str = "down") -> None:
         step = 3  # measured: device y=-3 == one wheel notch down
-        per = {"down": (0, -step), "up": (0, step), "right": (step, 0), "left": (-step, 0)}[direction]
+        per = {
+            "down": (0, -step),
+            "up": (0, step),
+            "right": (step, 0),
+            "left": (-step, 0),
+        }[direction]
         for _ in range(abs(notches)):
-            await self.post_ok("/api/hid/events/send_mouse_wheel",
-                               query={"delta_x": per[0], "delta_y": per[1]})
+            await self.post_ok(
+                "/api/hid/events/send_mouse_wheel",
+                query={"delta_x": per[0], "delta_y": per[1]},
+            )
             await asyncio.sleep(0.03)
         self.last_input_ts = time.time()
 
     # -- MSD / mass-storage file transfer -------------------------------------
 
-    async def _authed_params(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _authed_params(
+        self, extra: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         tok = await self.login()
         q = {"auth_token": tok}
         q.update(extra or {})
@@ -265,7 +475,7 @@ class GlkvmClient:
         headers = {"token": tok, "Content-Length": str(size)}
 
         async def chunks():
-            f = await asyncio.to_thread(open, local_path, "rb")
+            f = cast(BinaryIO, await asyncio.to_thread(open, local_path, "rb"))
             try:
                 while True:
                     b = await asyncio.to_thread(f.read, 1 << 20)
@@ -275,8 +485,9 @@ class GlkvmClient:
             finally:
                 await asyncio.to_thread(f.close)
 
-        r = await http.request("POST", "/api/msd/write", params=q, headers=headers,
-                               content=chunks())
+        r = await http.request(
+            "POST", "/api/msd/write", params=q, headers=headers, content=chunks()
+        )
         if r.status_code == 401:
             await self.login(force=True)
             return await self.msd_write_image(local_path, image)
@@ -288,8 +499,9 @@ class GlkvmClient:
             raise GlkvmError(f"msd/write wrote {written} of {size}")
         return written
 
-    async def msd_download_image(self, image: str, out_path: str,
-                                 compress: str = "zstd") -> int:
+    async def msd_download_image(
+        self, image: str, out_path: str, compress: str = "zstd"
+    ) -> int:
         """Stream an MSD image back to a local file ("reversed" transfer).
         compress: "" (raw), "zstd" or "lzma". Returns bytes written."""
         tok = await self.login()
@@ -297,8 +509,9 @@ class GlkvmClient:
         q = await self._authed_params({"image": image, "compress": compress})
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         total = 0
-        async with http.stream("GET", "/api/msd/read", params=q,
-                               headers={"token": tok}) as r:
+        async with http.stream(
+            "GET", "/api/msd/read", params=q, headers={"token": tok}
+        ) as r:
             if r.status_code == 401:
                 await self.login(force=True)
                 return await self.msd_download_image(image, out_path, compress)
@@ -311,17 +524,24 @@ class GlkvmClient:
                     total += len(chunk)
         return total
 
-    async def msd_connect(self, image: str | None = None, cdrom: bool = False,
-                          rw: bool = False, connected: bool = True) -> dict:
+    async def msd_connect(
+        self,
+        image: str | None = None,
+        cdrom: bool = False,
+        rw: bool = False,
+        connected: bool = True,
+    ) -> dict:
         """Attach a stored image to the target as a USB drive (cdrom=False),
         or detach (connected=False). GL fork has both a cdrom drive and an rw
         partition drive; params land on the active one."""
         if image is None or not connected:
-            return await self.post_ok("/api/msd/set_connected",
-                                      query={"connected": 1 if connected else 0})
-        await self.post_ok("/api/msd/set_params",
-                           query={"image": image, "cdrom": 1 if cdrom else 0,
-                                  "rw": 1 if rw else 0})
+            return await self.post_ok(
+                "/api/msd/set_connected", query={"connected": 1 if connected else 0}
+            )
+        await self.post_ok(
+            "/api/msd/set_params",
+            query={"image": image, "cdrom": 1 if cdrom else 0, "rw": 1 if rw else 0},
+        )
         return await self.post_ok("/api/msd/set_connected", query={"connected": 1})
 
     async def msd_state(self) -> dict:
@@ -369,9 +589,12 @@ class GlkvmClient:
             if len(frames) < n:
                 await asyncio.sleep(max(0.0, (span_s / (n - 1)) - 0.05))
         diffs = []
-        for a, b in zip(frames, frames[1:]):
+        for a, b in zip(frames, frames[1:], strict=False):
             diffs.append(float((abs(b - a) > 24).mean()))
-        return {"span_s": round(time.time() - t0, 2), "diffs": [round(d, 5) for d in diffs]}
+        return {
+            "span_s": round(time.time() - t0, 2),
+            "diffs": [round(d, 5) for d in diffs],
+        }
 
     async def interference_check(self) -> dict:
         """Detect concurrent human input.
@@ -388,13 +611,18 @@ class GlkvmClient:
             pass
         quiet = time.time() - self.last_input_ts
         out: dict[str, Any] = {
-            "hid_inactivity_s": round(inact, 1) if inact is not None and inact >= 0 else None,
+            "hid_inactivity_s": round(inact, 1)
+            if inact is not None and inact >= 0
+            else None,
             "mcp_quiet_s": round(quiet, 1),
         }
         if inact is not None:
             foreign = quiet > 3.0 and inact < 3.0
-            out["verdict"] = ("foreign HID input detected (not from this tool)" if foreign
-                              else "quiet (no input outside this tool in the last few seconds)")
+            out["verdict"] = (
+                "foreign HID input detected (not from this tool)"
+                if foreign
+                else "quiet (no input outside this tool in the last few seconds)"
+            )
             out["warning"] = foreign
             return out
         # screen-motion fallback
@@ -404,8 +632,10 @@ class GlkvmClient:
         # screen visibly moving while this tool has been idle >3s -> someone else
         foreign = quiet > 3.0 and top > 0.004  # >0.4% of a 160x90 thumbnail changed
         if foreign:
-            out["verdict"] = ("target screen is moving while this tool is idle - a human "
-                              "or another KVM client may be working on it")
+            out["verdict"] = (
+                "target screen is moving while this tool is idle - a human "
+                "or another KVM client may be working on it"
+            )
         elif quiet <= 3.0:
             out["verdict"] = "recent tool input; motion is probably ours"
         else:

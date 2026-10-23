@@ -13,17 +13,20 @@ from unittest.mock import AsyncMock, Mock
 from PIL import Image
 
 from glkvm_mcp import server
+from glkvm_mcp.kvmd import GlkvmError, InputOutcomeUnknown
 
 
 def _ocr_lines(count: int = 1, text: str = "Status", score: float = 0.91) -> list:
     results = []
     for index in range(count):
         y = 10 + index * 30
-        results.append((
-            [[10, y], [210, y], [210, y + 20], [10, y + 20]],
-            text,
-            score,
-        ))
+        results.append(
+            (
+                [[10, y], [210, y], [210, y + 20], [10, y + 20]],
+                text,
+                score,
+            )
+        )
     return results
 
 
@@ -56,7 +59,9 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         server.ocr = self.original_ocr
         server._tree_cache.clear()
 
-    async def test_observe_is_fresh_text_only_and_reports_provenance_and_cache(self) -> None:
+    async def test_observe_is_fresh_text_only_and_reports_provenance_and_cache(
+        self,
+    ) -> None:
         first = await server.mcp.call_tool("observe_screen", {})
         second = await server.mcp.call_tool("observe_screen", {})
         one = _payload(first)
@@ -79,6 +84,69 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(one["lines"][0]["confidence_quality"], "estimated")
         self.assertEqual(server.ocr.run.call_count, 1)
 
+    async def test_bottom_selection_returns_tail_in_screen_order_and_reports_omissions(
+        self,
+    ) -> None:
+        results = []
+        for index in range(6):
+            y = 10 + index * 25
+            results.append(
+                (
+                    [[10, y], [210, y], [210, y + 20], [10, y + 20]],
+                    f"line-{index}",
+                    0.91,
+                )
+            )
+        server.ocr.run = Mock(return_value=(results, 5.0))
+        result = await server.mcp.call_tool(
+            "observe_screen",
+            {"max_lines": 2, "line_selection": "bottom"},
+        )
+        payload = _payload(result)
+
+        self.assertEqual(
+            [line["text"] for line in payload["lines"]], ["line-4", "line-5"]
+        )
+        self.assertEqual(
+            [line["bbox_xywh_px"][1] for line in payload["lines"]], [110, 135]
+        )
+        self.assertEqual(payload["truncation"]["lines_omitted"], 4)
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["limits"]["line_selection"], "bottom")
+
+    async def test_bottom_selection_keeps_tail_when_character_budget_truncates(
+        self,
+    ) -> None:
+        results = []
+        for index in range(6):
+            y = 10 + index * 25
+            results.append(
+                (
+                    [[10, y], [210, y], [210, y + 20], [10, y + 20]],
+                    f"line-{index}-" + ("x" * 600),
+                    0.91,
+                )
+            )
+        server.ocr.run = Mock(return_value=(results, 5.0))
+        result = await server.mcp.call_tool(
+            "observe_screen",
+            {
+                "max_lines": 2,
+                "max_chars": 1500,
+                "line_selection": "bottom",
+            },
+        )
+        payload = _payload(result)
+
+        self.assertLessEqual(
+            len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+            1500,
+        )
+        self.assertEqual(len(payload["lines"]), 1)
+        self.assertTrue(payload["lines"][0]["text"].startswith("line-5-"))
+        self.assertEqual(payload["truncation"]["lines_omitted"], 5)
+        self.assertTrue(payload["truncated"])
+
     async def test_low_confidence_is_returned_as_uncertain(self) -> None:
         server._tree_cache.clear()
         server.ocr.run = Mock(return_value=(_ocr_lines(score=0.21), 4.0))
@@ -94,7 +162,8 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         server._tree_cache.clear()
         server.ocr.run = Mock(return_value=(_ocr_lines(8, "x" * 600), 5.0))
         result = await server.mcp.call_tool(
-            "observe_screen", {"max_lines": 2, "max_chars": 1024},
+            "observe_screen",
+            {"max_lines": 2, "max_chars": 1024},
         )
         payload = _payload(result)
 
@@ -106,12 +175,18 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["truncated"])
         self.assertGreater(payload["truncation"]["lines_omitted"], 0)
 
-    async def test_saved_frames_are_unique_private_and_have_byte_provenance(self) -> None:
+    async def test_saved_frames_are_unique_private_and_have_byte_provenance(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["GLKVM_ARTIFACT_DIR"] = tmp
             try:
-                first = await server.mcp.call_tool("observe_screen", {"save_frame": True})
-                second = await server.mcp.call_tool("observe_screen", {"save_frame": True})
+                first = await server.mcp.call_tool(
+                    "observe_screen", {"save_frame": True}
+                )
+                second = await server.mcp.call_tool(
+                    "observe_screen", {"save_frame": True}
+                )
                 first_payload = _payload(first)
                 second_payload = _payload(second)
                 one = first_payload["saved_frame"]
@@ -120,7 +195,9 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(path_one, path_two)
                 self.assertEqual(path_one.read_bytes(), path_two.read_bytes())
                 self.assertEqual(one["bytes"], path_one.stat().st_size)
-                self.assertEqual(one["sha256"], hashlib.sha256(path_one.read_bytes()).hexdigest())
+                self.assertEqual(
+                    one["sha256"], hashlib.sha256(path_one.read_bytes()).hexdigest()
+                )
                 self.assertEqual(stat.S_IMODE(path_one.stat().st_mode), 0o400)
                 self.assertEqual(stat.S_IMODE(path_one.parent.stat().st_mode), 0o700)
                 self.assertEqual(
@@ -130,7 +207,9 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.environ.pop("GLKVM_ARTIFACT_DIR", None)
 
-    async def test_existing_permissive_directory_is_not_changed_and_limits_prevent_orphans(self) -> None:
+    async def test_existing_permissive_directory_is_not_changed_and_limits_prevent_orphans(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             artifact_dir = Path(tmp) / "existing"
             artifact_dir.mkdir(mode=0o755)
@@ -142,10 +221,12 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(stat.S_IMODE(artifact_dir.stat().st_mode), 0o755)
 
                 artifact_dir.chmod(0o700)
-                with unittest.mock.patch.object(server, "_observation_payload",
-                                                side_effect=ValueError("too large")):
+                with unittest.mock.patch.object(
+                    server, "_observation_payload", side_effect=ValueError("too large")
+                ):
                     result = await server.mcp.call_tool(
-                        "observe_screen", {"save_frame": True},
+                        "observe_screen",
+                        {"save_frame": True},
                     )
                 self.assertFalse(_payload(result)["ok"])
                 self.assertEqual(list(artifact_dir.iterdir()), [])
@@ -156,39 +237,85 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(dir=".") as tmp:
             expected_parent = Path(tmp).absolute()
             with unittest.mock.patch.dict(os.environ, {"GLKVM_ARTIFACT_DIR": tmp}):
-                result = await server.mcp.call_tool("observe_screen", {"save_frame": True})
+                result = await server.mcp.call_tool(
+                    "observe_screen", {"save_frame": True}
+                )
                 payload = json.loads(result.content[0].text)
                 self.assertTrue(payload["ok"])
                 artifact = payload["saved_frame"]
                 path = Path(artifact["path"])
                 self.assertTrue(path.is_absolute())
                 self.assertEqual(path.parent, expected_parent)
-                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), artifact["sha256"])
+                self.assertEqual(
+                    hashlib.sha256(path.read_bytes()).hexdigest(), artifact["sha256"]
+                )
 
     async def test_capture_and_save_failures_never_return_prior_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["GLKVM_ARTIFACT_DIR"] = tmp
             try:
-                previous = await server.mcp.call_tool("observe_screen", {"save_frame": True})
-                self.snapshot.side_effect = RuntimeError("stale server response with token")
-                capture_failure = await server.mcp.call_tool("observe_screen", {"save_frame": True})
+                previous = await server.mcp.call_tool(
+                    "observe_screen", {"save_frame": True}
+                )
+                self.snapshot.side_effect = RuntimeError(
+                    "stale server response with token"
+                )
+                capture_failure = await server.mcp.call_tool(
+                    "observe_screen", {"save_frame": True}
+                )
                 previous_payload = _payload(previous)
                 capture_payload = _payload(capture_failure)
                 self.assertFalse(capture_payload["ok"])
+                self.assertTrue(capture_failure.is_error)
+                self.assertEqual(
+                    capture_payload["failure"],
+                    {
+                        "stage": "capture",
+                        "category": "internal",
+                    },
+                )
                 self.assertNotIn("saved_frame", capture_payload)
                 self.assertNotIn("token", json.dumps(capture_payload).lower())
 
                 self.snapshot.side_effect = None
                 self.snapshot.return_value = (self.image, "frame-digest12")
-                with unittest.mock.patch.object(server, "_save_frame", side_effect=OSError("disk full")):
-                    save_failure = await server.mcp.call_tool("observe_screen", {"save_frame": True})
+                with unittest.mock.patch.object(
+                    server, "_save_frame", side_effect=OSError("disk full")
+                ):
+                    save_failure = await server.mcp.call_tool(
+                        "observe_screen", {"save_frame": True}
+                    )
                 save_payload = _payload(save_failure)
                 self.assertFalse(save_payload["ok"])
                 self.assertNotIn("saved_frame", save_payload)
-                self.assertNotIn(previous_payload["saved_frame"]["path"],
-                                 json.dumps(save_payload))
+                self.assertNotIn(
+                    previous_payload["saved_frame"]["path"], json.dumps(save_payload)
+                )
             finally:
                 os.environ.pop("GLKVM_ARTIFACT_DIR", None)
+
+    async def test_capture_error_includes_only_sanitized_category_and_http_status(
+        self,
+    ) -> None:
+        self.snapshot.side_effect = GlkvmError(
+            "https://device.invalid?token=private response text",
+            category="authentication",
+            status_code=403,
+        )
+        result = await server.mcp.call_tool("observe_screen", {})
+
+        self.assertTrue(result.is_error)
+        payload = _payload(result)
+        self.assertEqual(
+            payload["failure"],
+            {
+                "stage": "capture",
+                "category": "authentication",
+                "http_status": 403,
+            },
+        )
+        self.assertNotIn("device.invalid", json.dumps(payload))
+        self.assertNotIn("private response text", json.dumps(payload))
 
     async def test_ocr_cache_includes_letters_and_score_options(self) -> None:
         await server.screen_elements()
@@ -197,10 +324,13 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         await server.screen_elements(min_score=0.9)
         self.assertEqual(server.ocr.run.call_count, 3)
 
-    async def test_type_text_omits_value_only_when_requested_and_refresh_auth_sanitizes(self) -> None:
+    async def test_type_text_omits_value_only_when_requested_and_refresh_auth_sanitizes(
+        self,
+    ) -> None:
         secret = "password-token-should-not-be-returned"
         hidden = await server.mcp.call_tool(
-            "type_text", {"text": secret, "echo_text": False},
+            "type_text",
+            {"text": secret, "echo_text": False},
         )
         self.assertNotIn(secret, json.dumps(hidden.structured_content))
         self.assertEqual(hidden.structured_content["characters_typed"], len(secret))
@@ -214,6 +344,39 @@ class ObserveScreenTests(unittest.IsolatedAsyncioTestCase):
         refreshed = await server.mcp.call_tool("refresh_auth", {})
         self.assertFalse(refreshed.structured_content["ok"])
         self.assertNotIn(secret, json.dumps(refreshed.structured_content))
+        self.assertTrue(refreshed.is_error)
+        self.assertEqual(
+            refreshed.structured_content["failure"]["category"], "internal"
+        )
+
+    async def test_type_text_timeout_is_an_mcp_error_with_uncertain_status(
+        self,
+    ) -> None:
+        self.type_text_call.side_effect = InputOutcomeUnknown(category="timeout")
+        result = await server.mcp.call_tool("type_text", {"text": "long command"})
+
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.structured_content["status"], "uncertain")
+        self.assertEqual(result.structured_content["failure"], {"category": "timeout"})
+        self.assertIn(
+            "inspect the target before retrying", result.structured_content["error"]
+        )
+
+    async def test_type_text_limit_rejects_before_dispatching_to_driver(self) -> None:
+        secret = "oversized-sensitive-input"
+        self.type_text_call.side_effect = GlkvmError(
+            "input exceeds limit",
+            category="validation",
+        )
+        result = await server.mcp.call_tool("type_text", {"text": secret * 400})
+
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.structured_content["status"], "rejected")
+        self.assertFalse(result.structured_content["typing_started"])
+        self.assertEqual(
+            result.structured_content["failure"], {"category": "validation"}
+        )
+        self.assertNotIn(secret, json.dumps(result.structured_content))
 
 
 if __name__ == "__main__":
