@@ -1,14 +1,22 @@
 # glkvm-mcp
 
-MCP server for the GLKVM KVM session: accurate mouse, complete keyboard, OCR element tree, human-interference detection. It drives a GL.iNet GLKVM (PiKVM kvmd fork) over its HTTPS API, with no agent installed on the target; the target sees only an HID composite device and the HDMI input.
+This is the [ShoGinn fork](https://github.com/ShoGinn/glkvm-mcp) of
+[GlassOnTin/glkvm-mcp](https://github.com/GlassOnTin/glkvm-mcp). The original
+implementation and hardware calibration come from upstream. Fork changes add
+bounded text observations, authentication recovery, input reliability, and
+local quality checks. See [fork stewardship](docs/FORK.md), the
+[changelog](CHANGELOG.md), [contributing](CONTRIBUTING.md), and
+[security guidance](SECURITY.md).
 
-Built and verified against a GL.iNet RM10 running kvmd 4.82 (GL fork). Other GLKVM models on the same firmware should behave the same. Stock upstream PiKVM is untested: the driver re-logins on the GL fork's stale-token 403 behaviour and falls back to screen-motion probing when `/api/hid/inactivity` 404s, none of which runs against stock kvmd.
+MCP server for the GLKVM KVM session: accurate mouse, complete keyboard, OCR element tree, human-interference detection. It drives a GL.iNet GLKVM (PiKVM kvmd fork) over its HTTPS API, with no agent installed on the target; the main control path uses USB HID and HDMI capture; optional MSD tools also expose USB storage.
+
+Upstream reports building and verifying against a GL.iNet RM10 running kvmd 4.82 (GL fork). Other models and firmware versions require their own validation. Stock upstream PiKVM is untested: the shared request driver retries a GET once after authentication recovery for a 401 or the GL fork's stale-token 403 response and falls back to screen-motion probing when `/api/hid/inactivity` 404s, these compatibility paths have not been verified against stock kvmd.
 
 ## Requirements
 
 - Python 3.12+ with uv
 - A GLKVM device reachable over HTTPS, and its web UI password
-- OCR runs locally: rapidocr-onnxruntime on CPU (frames are not sent anywhere)
+- OCR runs locally with rapidocr-onnxruntime on CPU. OCR text and tool results go to your MCP client; `screenshot` returns image content to that client.
 
 ## Configuration
 
@@ -21,19 +29,41 @@ Built and verified against a GL.iNet RM10 running kvmd 4.82 (GL fork). Other GLK
 | `GLKVM_ALLOW_MSD` | unset | Set to `1`/`true`/`yes` to enable the `msd_*` tools |
 | `GLKVM_ARTIFACT_DIR` | `~/.local/share/glkvm-mcp/artifacts` | Private local directory for frames explicitly saved by `observe_screen` |
 
-Setup and registration in Claude Code (`.mcp.json`):
+## Installation and startup
+
+Clone the fork and install the locked dependencies:
+
+```sh
+git clone https://github.com/ShoGinn/glkvm-mcp.git
+cd glkvm-mcp
+uv sync --locked
+```
+
+Provide `GLKVM_PASSWORD` through your MCP host's secret/environment mechanism.
+For a local launch with that variable already exported:
+
+```sh
+uv run --frozen python -m glkvm_mcp.server
+```
+
+The server uses stdio. Configure the host to launch from the checkout; if its
+working directory is elsewhere, use uv's `--directory` option with the absolute
+checkout path. The following Claude Code `.mcp.json` example inherits the password
+from the launching environment (do not commit credentials):
 
 ```json
 {
   "mcpServers": {
     "glkvm": {
       "command": "uv",
-      "args": ["run", "--frozen", "python", "-m", "glkvm_mcp.server"],
-      "env": { "GLKVM_PASSWORD": "your-device-password" }
+      "args": ["run", "--directory", "/absolute/path/to/glkvm-mcp", "--frozen", "python", "-m", "glkvm_mcp.server"]
     }
   }
 }
 ```
+
+The configuration variables above are read at startup, except the MSD opt-in
+and artifact directory, which are checked when those tools are called.
 
 ## Tools
 
@@ -82,8 +112,8 @@ before input starts. A timed-out `type_text` request returns `status="uncertain"
 kvmd may have received some or all of the input. Input requests are never
 automatically retried; inspect the target before trying again.
 
-Python 3.14 is the pinned development runtime because the OCR dependency does
-not publish wheels for newer Python versions yet. Sync and run the same checks
+Python 3.14 is pinned in `.python-version` and CI. The package declares Python
+3.12+; the automated workflow currently checks only 3.14. Sync and run the same checks
 used in CI with:
 
 ```sh
@@ -103,13 +133,34 @@ File transfer (opt-in via `GLKVM_ALLOW_MSD=1`, see below):
 
 - `msd_state`, `msd_push_files`, `msd_pull_files`, `msd_connect`, `msd_disconnect`, `msd_remove_image`
 
-The `msd_*` tools use the KVM's emulated USB mass-storage drive: push wraps files in a FAT image and attaches it as a USB disk on the target; pull streams the image back after the target writes files to it. They are disabled by default because attaching USB storage is visible to the target (and to any EDP/security tooling on it), while the HID + HDMI path stays quiet. For managed targets, keep the MSD tools off.
+The `msd_*` tools use the KVM's emulated USB mass-storage drive: push wraps files in a FAT image and attaches it as a USB disk on the target; pull streams the image back after the target writes files to it. They are disabled by default because attaching USB storage is visible to the target (and to any EDP/security tooling on it). HID actions also affect the target and may be observed or audited. Keep MSD off unless the target owner authorizes removable storage. This flag gates only the named `msd_*` wrappers; `kvmd_api` can still POST directly to `/api/msd`, so it is not a security boundary.
 
 ## Accuracy notes
 
 Absolute mouse mapping was measured at 1px error on 2560x1440 firmware. GL maps only the middle 90% of the screen width to the axis range; the constants live in `glkvm_mcp/kvmd.py` and are fractions of the frame size, so other resolutions need a re-measure. OCR boxes are pixel-accurate for line boxes, a few px for word boxes.
 
-Verified live: keyboard (keys, combos, Unicode typing over `/api/hid/print`), mouse absolute/relative/wheel/drag, caps-lock LED echo probe, snapshot, OCR tree, MSD push/pull byte-exact roundtrip. Not exercised live: `msd_connect`/`msd_disconnect` attach/detach (deliberately - it injects a USB-drive event into the session in use), horizontal wheel direction, and `human_activity` against a genuinely concurrent human operator.
+The upstream README reports live verification of keyboard (keys, combos, Unicode typing over `/api/hid/print`), mouse absolute/relative/wheel/drag, caps-lock LED echo probe, snapshot, OCR tree, MSD push/pull byte-exact roundtrip. Upstream lists these as not exercised live: `msd_connect`/`msd_disconnect` attach/detach (deliberately - it injects a USB-drive event into the session in use), horizontal wheel direction, and `human_activity` against a genuinely concurrent human operator.
+
+Fork tests use mocks and local artifacts; they do not establish fresh hardware
+verification. For each hardware check, record the commit, model, firmware,
+resolution, tools exercised, and outcome. No console actions are needed to run
+the offline checks above.
+
+## Troubleshooting
+
+- Authentication failure: check the host and user, ensure the password reaches
+  the server environment, then use `refresh_auth`. Never share tokens or raw
+  response bodies in an issue.
+- Failed capture: discard the previous observation for action planning. Obtain
+  a successful fresh observation before sending input.
+- Uncertain typing result: inspect the screen before retrying; text may already
+  have reached the target.
+- Artifact save failure: use a directory owned by the server user with owner-only
+  access and write permission. The tool refuses an existing permissive directory.
+- Dependency or tool mismatch: run `uv sync --locked`, restart the MCP host, and
+  obtain a fresh observation. Confirm it launches the intended checkout.
+
+See [SECURITY.md](SECURITY.md) for TLS, token-cache, and data-handling limitations.
 
 ## License
 
