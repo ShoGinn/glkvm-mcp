@@ -34,8 +34,9 @@ def _tree_size(p: str) -> int:
     return total + 4096  # root directory slack
 
 
-async def build_fat_image(paths: list[str], out_path: str,
-                          size_mb: int = 0) -> tuple[int, list[str]]:
+async def build_fat_image(
+    paths: list[str], out_path: str, size_mb: int = 0
+) -> tuple[int, list[str]]:
     """Create a FAT image at out_path containing the given files/dirs (top-level
     entries keep their basenames; dirs copy recursively via mcopy -s).
 
@@ -60,7 +61,9 @@ async def build_fat_image(paths: list[str], out_path: str,
         size_mb = max(8, math.ceil(payload * 1.4 / 1048576) + 8)
     size_bytes = size_mb * 1048576
     if payload > size_bytes - 1048576:
-        raise MsdFatError(f"payload {payload} B does not fit in {size_mb} MB; pass size_mb")
+        raise MsdFatError(
+            f"payload {payload} B does not fit in {size_mb} MB; pass size_mb"
+        )
     await asyncio.to_thread(_build, specs, out_path, size_bytes)
     return size_bytes, [s[0] for s in specs]
 
@@ -71,7 +74,7 @@ def _build(specs: list[tuple[str, str | None]], out_path: str, size_bytes: int) 
     with open(out_path, "wb") as f:
         f.truncate(size_bytes)
     _run(["mkfs.vfat", "-n", "GLKVMMCP", out_path])
-    for (src, name) in specs:
+    for src, name in specs:
         arg = f"::{name}" if name else "::"
         _run(["mcopy", "-i", out_path, "-s", src, arg])
 

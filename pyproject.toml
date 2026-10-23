@@ -1,6 +1,6 @@
 [project]
 name = "glkvm-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP server for the GLKVM KVM session: accurate mouse, complete keyboard, OCR element tree, human-interference detection"
 license = "AGPL-3.0-or-later"
 requires-python = ">=3.12"
@@ -16,3 +16,15 @@ dependencies = [
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.2",
+    "ty>=0.0.91",
+]

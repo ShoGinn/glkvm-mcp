@@ -8,25 +8,34 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
+import stat
 import time
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.tools.base import ToolResult
 from fastmcp.utilities.types import Image
+from mcp.types import TextContent
+from PIL import Image as PILImage
 
-from .kvmd import GlkvmClient, GlkvmError
-from .vision import Engine, build_tree, flatten, find_text
+from .kvmd import GlkvmClient, GlkvmError, InputOutcomeUnknown, safe_error_details
+from .vision import Engine, build_tree, find_text
 
 mcp = FastMCP(
     "glkvm",
     instructions=(
         "Drive and observe the GLKVM KVM session (target machine screen, 2560x1440). "
-        "Coordinates are target-screen pixels. Use screenshot()/screen_elements() to see the "
-        "screen, then click_at/click_text/key/key_combo/type_text to act. "
+        "Coordinates are target-screen pixels. Prefer observe_screen() for bounded text-only "
+        "checks; use screenshot() when visual context or OCR verification is needed. "
+        "Use screen_elements() when clickable OCR boxes are needed. "
+        "Inspect the target before using click_at/click_text/key/key_combo/type_text to act. "
         "Keyboard keys are KeyboardEvent.code names (MetaLeft/KeyA/Enter/F1/Escape/...). "
         "File transfer needs no target agent: msd_push_files wraps files in a FAT image and "
         "attaches it as a USB drive on the target; msd_pull_files streams that image back "
@@ -37,24 +46,217 @@ mcp = FastMCP(
 
 client = GlkvmClient()
 ocr = Engine()
-_tree_cache: dict[str, Any] = {}  # sha -> (tree, ts)
+_tree_cache: dict[tuple[str, str, bool, float], dict[str, Any]] = {}
 
 
-async def _snap() -> tuple[Image, dict]:
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _tree_for(
+    img: PILImage.Image,
+    sha: str,
+    *,
+    letters: bool,
+    min_score: float,
+    force_refresh: bool = False,
+    pixel_sha256: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Return OCR for this frame and the exact options used to build its tree."""
+    pixel_identity = pixel_sha256 or _pixel_sha256(img)
+    cache_key = (sha, pixel_identity, letters, float(min_score))
+    if not force_refresh and cache_key in _tree_cache:
+        return _tree_cache[cache_key], True
+    res, ocr_ms = ocr.run(img, 1.0)
+    tree = build_tree(
+        res,
+        img.width,
+        img.height,
+        sha,
+        time.time(),
+        ocr_ms,
+        letters=letters,
+        min_score=min_score,
+    )
+    _tree_cache[cache_key] = tree
+    while len(_tree_cache) > 16:
+        _tree_cache.pop(next(iter(_tree_cache)))
+    return tree, False
+
+
+def _pixel_sha256(img: PILImage.Image) -> str:
+    """Hash decoded pixels so the observation identity is not a short JPEG digest."""
+    digest = hashlib.sha256()
+    digest.update(img.width.to_bytes(8, "big"))
+    digest.update(img.height.to_bytes(8, "big"))
+    digest.update(img.convert("RGB").tobytes())
+    return digest.hexdigest()
+
+
+def _artifact_directory() -> Path:
+    configured = os.environ.get("GLKVM_ARTIFACT_DIR")
+    path = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".local/share/glkvm-mcp/artifacts"
+    )
+    # Make returned paths portable across agent working directories without
+    # resolving away a final symlink before the ownership/type check below.
+    path = path.absolute()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.getuid()
+    ):
+        raise OSError(
+            "artifact directory is not a private directory owned by this server user"
+        )
+    permissions = stat.S_IMODE(info.st_mode)
+    if permissions & 0o077 or not permissions & 0o200:
+        raise OSError("artifact directory must be owner-only and writable")
+    return path
+
+
+def _save_frame(
+    img: PILImage.Image,
+    observation_id: str,
+    captured_at: str,
+    frame_sha256: str,
+    artifact_dir: Path,
+) -> dict[str, Any]:
+    """Save a fresh frame with exclusive creation and private, read-only permissions."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    data = buf.getvalue()
+    digest = hashlib.sha256(data).hexdigest()
+    path = artifact_dir / f"{observation_id}.png"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(path, 0o400)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return {
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": digest,
+        "format": "png",
+        "provenance": {
+            "observation_id": observation_id,
+            "capture_received_at_utc": captured_at,
+            "frame_sha256": frame_sha256,
+            "source": "fresh screen capture received by this local MCP server",
+        },
+    }
+
+
+def _text_result(payload: dict[str, Any], *, is_error: bool = False) -> ToolResult:
+    """Return one client-visible JSON text block without a duplicate structured echo."""
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return ToolResult(content=[TextContent(text=text)], is_error=is_error)
+
+
+def _structured_error(payload: dict[str, Any]) -> ToolResult:
+    """Return a structured MCP error while keeping its text block readable."""
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return ToolResult(
+        content=[TextContent(text=text)], structured_content=payload, is_error=True
+    )
+
+
+def _observation_payload(
+    base: dict[str, Any],
+    lines: list[dict[str, Any]],
+    *,
+    max_lines: int,
+    max_chars: int,
+    total_text_chars: int,
+    total_line_count: int | None = None,
+    preserve_tail: bool = False,
+) -> dict[str, Any]:
+    """Apply line and serialized-JSON character limits with explicit truncation."""
+    included = [dict(line) for line in lines[:max_lines]]
+    payload = {**base, "lines": included}
+
+    def update_truncation() -> None:
+        included_chars = sum(len(line["text"]) for line in included)
+        total_lines = len(lines) if total_line_count is None else total_line_count
+        payload["truncated"] = (
+            total_lines > len(included) or included_chars < total_text_chars
+        )
+        payload["truncation"] = {
+            "lines_omitted": max(0, total_lines - len(included)),
+            "text_characters_omitted": max(0, total_text_chars - included_chars),
+        }
+
+    def encoded_length() -> int:
+        return len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+    update_truncation()
+    while encoded_length() > max_chars:
+        candidates = included if preserve_tail else reversed(included)
+        last_text = next((line for line in candidates if line["text"]), None)
+        if last_text is not None:
+            original = last_text["text"]
+            low, high, best = 0, len(original) - 1, None
+            while low <= high:
+                middle = (low + high) // 2
+                last_text["text"] = original[:middle]
+                last_text["text_truncated"] = True
+                update_truncation()
+                if encoded_length() <= max_chars:
+                    best = middle
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            last_text["text"] = original[:best] if best is not None else ""
+            last_text["text_truncated"] = True
+        elif included:
+            included.pop(0 if preserve_tail else -1)
+        else:
+            # The public minimum is chosen to fit the fixed provenance fields.
+            raise ValueError("max_chars is too small for observation metadata")
+        update_truncation()
+    included[:] = [
+        line
+        for line in included
+        if line["text"] or not line.get("text_truncated", False)
+    ]
+    update_truncation()
+    return payload
+
+
+async def _snap() -> tuple[PILImage.Image, dict[str, Any]]:
     img, sha = await client.snapshot()
-    tree = None
-    if _tree_cache.get("sha") == sha:
-        tree = _tree_cache.get("tree")
+    pixel_identity = _pixel_sha256(img)
     info = {
         "frame_sha": sha,
         "resolution": {"width": img.width, "height": img.height},
         "ms_since_frame_capture": None,
-        "cached_element_tree": tree is not None,
+        "cached_element_tree": any(
+            key[:2] == (sha, pixel_identity) for key in _tree_cache
+        ),
     }
     return img, info
 
 
-def _scale_img(img, max_w: int, quality: int):
+def _scale_img(img: PILImage.Image, max_w: int, quality: int) -> tuple[bytes, float]:
     if img.width > max_w:
         r = max_w / img.width
         img = img.resize((max_w, int(img.height * r)))
@@ -68,6 +270,7 @@ def _scale_img(img, max_w: int, quality: int):
 
 # ---------------------------------------------------------------- screenshot
 
+
 @mcp.tool()
 async def screenshot(max_width: int = 1600, quality: int = 80) -> Image:
     """Live screenshot of the target machine's screen (JPEG).
@@ -79,7 +282,213 @@ async def screenshot(max_width: int = 1600, quality: int = 80) -> Image:
     return Image(data=data, format="jpeg")
 
 
+@mcp.tool()
+async def observe_screen(
+    max_lines: int = 40,
+    max_chars: int = 12000,
+    save_frame: bool = False,
+    line_selection: Literal["top", "bottom"] = "top",
+) -> ToolResult:
+    """Capture a fresh screen and return compact OCR text without image content.
+
+    Bboxes are native target-screen pixels. Confidence is a model estimate, not
+    proof that text is correct; low-confidence lines need visual verification.
+    line_selection chooses the first or last lines in screen reading order;
+    returned lines remain top-to-bottom. max_chars limits the serialized
+    observation JSON. The timestamp is when this server received the capture;
+    device capture time and physical target identity are unavailable. save_frame writes a private, unique PNG to this server's
+    local artifact directory and returns its path, size, hash, and provenance.
+    """
+    if not 1 <= max_lines <= 100:
+        return _text_result(
+            {
+                "ok": False,
+                "error": "max_lines must be between 1 and 100",
+            },
+            is_error=True,
+        )
+    if not 1024 <= max_chars <= 32768:
+        return _text_result(
+            {
+                "ok": False,
+                "error": "max_chars must be between 1024 and 32768",
+            },
+            is_error=True,
+        )
+    if line_selection not in ("top", "bottom"):
+        return _text_result(
+            {
+                "ok": False,
+                "error": "line_selection must be 'top' or 'bottom'",
+            },
+            is_error=True,
+        )
+
+    try:
+        # Always acquire a new frame, even when OCR for identical pixels is cached.
+        img, source_sha = await client.snapshot()
+    except Exception as exc:
+        return _text_result(
+            {
+                "ok": False,
+                "error": "fresh KVM capture failed; no previous capture was returned",
+                "failure": {"stage": "capture", **safe_error_details(exc)},
+            },
+            is_error=True,
+        )
+
+    captured_at = _utc_now()
+    observation_id = str(uuid.uuid4())
+    frame_sha256 = _pixel_sha256(img)
+    try:
+        tree, cached = _tree_for(
+            img, source_sha, letters=False, min_score=0.0, pixel_sha256=frame_sha256
+        )
+    except Exception as exc:
+        return _text_result(
+            {
+                "ok": False,
+                "error": "OCR failed for the fresh capture; no cached observation was returned",
+                "failure": {"stage": "ocr", **safe_error_details(exc)},
+            },
+            is_error=True,
+        )
+
+    ocr_ts = float(tree["frame"].get("ocr_ts", time.time()))
+    lines: list[dict[str, Any]] = []
+    for block in tree.get("blocks", []):
+        for line in block.get("lines", []):
+            score = float(line.get("score", 0.0))
+            lines.append(
+                {
+                    "text": str(line.get("text", "")),
+                    "bbox_xywh_px": line.get("bbox", [0, 0, 0, 0]),
+                    "confidence": round(score, 3),
+                    "confidence_quality": "low" if score < 0.60 else "estimated",
+                }
+            )
+
+    all_lines = lines
+    selected_lines = (
+        all_lines[-max_lines:] if line_selection == "bottom" else all_lines[:max_lines]
+    )
+    artifact_dir = None
+    saved_frame = None
+    if save_frame:
+        try:
+            artifact_dir = _artifact_directory()
+            saved_frame = {
+                "path": str(artifact_dir / f"{observation_id}.png"),
+                "bytes": 18446744073709551615,
+                "sha256": "0" * 64,
+                "format": "png",
+                "provenance": {
+                    "observation_id": observation_id,
+                    "capture_received_at_utc": captured_at,
+                    "frame_sha256": frame_sha256,
+                    "source": "fresh screen capture received by this local MCP server",
+                },
+            }
+        except Exception as exc:
+            return _text_result(
+                {
+                    "ok": False,
+                    "error": "fresh capture could not be saved; no previous artifact was returned",
+                    "failure": {
+                        "stage": "artifact_directory",
+                        **safe_error_details(exc),
+                    },
+                },
+                is_error=True,
+            )
+
+    base = {
+        "ok": True,
+        "observation_id": observation_id,
+        "capture_received_at_utc": captured_at,
+        "capture_time_source": "local MCP server receipt time",
+        "device_capture_timestamp_utc": None,
+        "device_capture_timestamp_available": False,
+        "target_identity": {"value": None, "status": "unknown"},
+        "frame_sha256": frame_sha256,
+        "frame_hash_basis": "SHA-256 of decoded RGB pixels and dimensions",
+        "snapshot_response_sha256_prefix12": source_sha,
+        "resolution_px": {"width": img.width, "height": img.height},
+        "ocr": {
+            "timestamp_utc": datetime.fromtimestamp(ocr_ts, UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "cached": cached,
+            "cache_age_ms": max(0, round((time.time() - ocr_ts) * 1000))
+            if cached
+            else 0,
+        },
+        "interpretation": "OCR is approximate; low-confidence lines may be wrong.",
+        "saved_frame": saved_frame,
+        "limits": {
+            "max_lines": max_lines,
+            "max_chars": max_chars,
+            "line_selection": line_selection,
+        },
+    }
+    total_text_chars = sum(len(line["text"]) for line in lines)
+    try:
+        payload = _observation_payload(
+            base,
+            selected_lines,
+            max_lines=max_lines,
+            max_chars=max_chars,
+            total_text_chars=total_text_chars,
+            total_line_count=len(all_lines),
+            preserve_tail=line_selection == "bottom",
+        )
+    except Exception:
+        return _text_result(
+            {
+                "ok": False,
+                "error": "observation could not fit the requested output limit",
+            },
+            is_error=True,
+        )
+    if save_frame:
+        saved_path = None
+        try:
+            assert artifact_dir is not None
+            saved_frame = _save_frame(
+                img, observation_id, captured_at, frame_sha256, artifact_dir
+            )
+            saved_path = Path(saved_frame["path"])
+            base["saved_frame"] = saved_frame
+            payload = _observation_payload(
+                base,
+                selected_lines,
+                max_lines=max_lines,
+                max_chars=max_chars,
+                total_text_chars=total_text_chars,
+                total_line_count=len(all_lines),
+                preserve_tail=line_selection == "bottom",
+            )
+        except Exception:
+            if saved_path is not None:
+                try:
+                    saved_path.unlink()
+                except OSError:
+                    pass
+            return _text_result(
+                {
+                    "ok": False,
+                    "error": "fresh capture could not be saved; no previous artifact was returned",
+                    "failure": {"stage": "save_frame", "category": "local_storage"},
+                },
+                is_error=True,
+            )
+    # A single JSON text block is visible to ordinary MCP clients and avoids a
+    # duplicate structured-content copy of the same JSON. No image/resource blocks.
+    return _text_result(payload)
+
+
 # ---------------------------------------------------------------- element tree
+
 
 @mcp.tool()
 async def screen_elements(
@@ -87,7 +496,7 @@ async def screen_elements(
     min_score: float = 0.45,
     max_width: int = 1600,
     force_refresh: bool = False,
-) -> dict:
+) -> ToolResult:
     """OCR the live screen into a clickable element tree.
 
     Structure: blocks -> lines -> words (and optionally letters), each word with
@@ -98,26 +507,22 @@ async def screen_elements(
 
     Use force_refresh to re-OCR even if the frame hasn't changed."""
     img, sha = await client.snapshot()
-    now = time.time()
-    cached = _tree_cache.get("sha") == sha and not force_refresh
-    if cached:
-        tree = _tree_cache["tree"]
-    else:
-        res, ocr_ms = ocr.run(img, 1.0)
-        tree = build_tree(res, img.width, img.height, sha, now, ocr_ms, letters=letters,
-                          min_score=min_score)
-        _tree_cache["sha"] = sha
-        _tree_cache["tree"] = tree
+    tree, cached = _tree_for(
+        img, sha, letters=letters, min_score=min_score, force_refresh=force_refresh
+    )
     data, scale = _scale_img(img, max_width, 80)
     return ToolResult(
-        content=[Image(data=data, format="jpeg"),
-                 # JSON text block so text clients can read the tree without an image decoder
-                 json.dumps(tree)],
+        content=[
+            Image(data=data, format="jpeg"),
+            # JSON text block so text clients can read the tree without an image decoder
+            json.dumps(tree),
+        ],
         structured_content=tree,
     )
 
 
 # ---------------------------------------------------------------- click helpers
+
 
 @mcp.tool()
 async def click_at(
@@ -135,9 +540,14 @@ async def click_at(
         if i:
             await asyncio.sleep(gap_ms / 1000)
         await client.mouse_click(x, y, button)
-    return {"ok": True, "clicked": [x, y], "button": button, "clicks": clicks,
-            "note": "cursor tip lands at the given px",
-            "interference": foreign}
+    return {
+        "ok": True,
+        "clicked": [x, y],
+        "button": button,
+        "clicks": clicks,
+        "note": "cursor tip lands at the given px",
+        "interference": foreign,
+    }
 
 
 @mcp.tool()
@@ -155,50 +565,63 @@ async def click_text(
     matched text and bbox. Requires a positive match to move - never guesses
     coordinates."""
     img, sha = await client.snapshot()
-    tree = _tree_cache.get("tree") if (_tree_cache.get("sha") == sha) else None
-    if tree is None:
-        res, ocr_ms = ocr.run(img, 1.0)
-        tree = build_tree(res, img.width, img.height, sha, time.time(), ocr_ms,
-                          letters=letters)
-        _tree_cache["sha"] = sha
-        _tree_cache["tree"] = tree
+    tree, _ = _tree_for(img, sha, letters=letters, min_score=0.45)
     matches = find_text(tree, query, nth, exact)
     if not matches:
-        return {"ok": False, "error": f"no text matching {query!r}",
-                "hint": "call screen_elements() to see what is on screen", "matches": []}
+        return {
+            "ok": False,
+            "error": f"no text matching {query!r}",
+            "hint": "call screen_elements() to see what is on screen",
+            "matches": [],
+        }
     m = matches[0]
     cx, cy = m["center"]
-    foreign = await client.interference_check()
+    await client.interference_check()
     await client.mouse_click(cx, cy, button)
-    return {"ok": True, "clicked": [round(cx), round(cy)], "target": m,
-            "alternatives": [{"id": n["id"], "text": n["text"]} for n in matches[1:8]]}
+    return {
+        "ok": True,
+        "clicked": [round(cx), round(cy)],
+        "target": m,
+        "alternatives": [{"id": n["id"], "text": n["text"]} for n in matches[1:8]],
+    }
 
 
 # ---------------------------------------------------------------- mouse
+
 
 @mcp.tool()
 async def move_mouse(x: int, y: int) -> dict:
     """Move the target's cursor to (x, y) in screen pixels (no click)."""
     v = await client.mouse_move(x, y)
-    return {"ok": True, "px": [x, y], "device_int16": v,
-            "note": "reachable x range is the middle 90% of the frame (GL firmware quirk); "
-                    "use mouse_relative for the extreme edges"}
+    return {
+        "ok": True,
+        "px": [x, y],
+        "device_int16": v,
+        "note": "reachable x range is the middle 90% of the frame (GL firmware quirk); "
+        "use mouse_relative for the extreme edges",
+    }
 
 
 @mcp.tool()
 async def mouse_relative(
-    dx: int = 0, dy: int = 0,
+    dx: int = 0,
+    dy: int = 0,
 ) -> dict:
     """Nudge the cursor by a relative delta (for the unreachable 5% screen edges)."""
-    await client.request("POST", "/api/hid/events/send_mouse_relative",
-                         query={"delta_x": max(-127, min(127, dx)),
-                                "delta_y": max(-127, min(127, dy))})
+    await client.request(
+        "POST",
+        "/api/hid/events/send_mouse_relative",
+        query={"delta_x": max(-127, min(127, dx)), "delta_y": max(-127, min(127, dy))},
+    )
     return {"ok": True, "delta": [dx, dy]}
 
 
 @mcp.tool()
 async def drag(
-    x1: int, y1: int, x2: int, y2: int,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
     button: Literal["left", "right", "middle"] = "left",
     steps: int = 14,
     settle_ms: int = 120,
@@ -236,6 +659,7 @@ async def scroll(
 
 # ---------------------------------------------------------------- keyboard
 
+
 @mcp.tool()
 async def key(
     name: str,
@@ -264,14 +688,54 @@ async def key_combo(keys: list[str]) -> dict:
 
 
 @mcp.tool()
-async def type_text(text: str, delay_ms: int = 10) -> dict:
+async def type_text(
+    text: str, delay_ms: int = 10, echo_text: bool = True
+) -> dict[str, Any] | ToolResult:
     """Type unicode text on the target via kvmd's keysym printer (server-side
-    layout translation). Click a text field first."""
-    await client.type_text(text, delay_ms / 1000)
-    return {"ok": True, "typed": text}
+    layout translation). Click a text field first. Set echo_text=False to omit
+    the typed value from the result; tool arguments may still be logged, so this
+    is not a secret-safe input channel."""
+    try:
+        await client.type_text(text, delay_ms / 1000)
+    except InputOutcomeUnknown as exc:
+        return _structured_error(
+            {
+                "ok": False,
+                "status": "uncertain",
+                "error": "text may be partially entered; inspect the target before retrying",
+                "characters_requested": len(text),
+                "failure": safe_error_details(exc),
+            }
+        )
+    except GlkvmError as exc:
+        if exc.category == "validation":
+            return _structured_error(
+                {
+                    "ok": False,
+                    "status": "rejected",
+                    "typing_started": False,
+                    "characters_requested": len(text),
+                    "error": "typing request rejected before input",
+                    "failure": safe_error_details(exc),
+                }
+            )
+        return _structured_error(
+            {
+                "ok": False,
+                "status": "failed",
+                "typing_started": False,
+                "characters_requested": len(text),
+                "error": "typing request could not start",
+                "failure": safe_error_details(exc),
+            }
+        )
+    if echo_text:
+        return {"ok": True, "typed": text}
+    return {"ok": True, "characters_typed": len(text)}
 
 
 # ---------------------------------------------------------------- file transfer
+
 
 # MSD attaches a USB drive on the target - visible to target-side security
 # tooling (PnP audit, removable-storage DLP). Off unless GLKVM_ALLOW_MSD=1.
@@ -280,10 +744,12 @@ def _msd_guard() -> dict | None:
         return {
             "ok": False,
             "disabled": True,
-            "error": ("MSD file-transfer tools are disabled by default: attaching a USB "
-                      "drive on the target is visible to target-side security tooling "
-                      "(device-install audit, removable-storage rules). Set "
-                      "GLKVM_ALLOW_MSD=1 in the glkvm server env in .mcp.json to enable."),
+            "error": (
+                "MSD file-transfer tools are disabled by default: attaching a USB "
+                "drive on the target is visible to target-side security tooling "
+                "(device-install audit, removable-storage rules). Set "
+                "GLKVM_ALLOW_MSD=1 in the glkvm server env in .mcp.json to enable."
+            ),
         }
     return None
 
@@ -293,7 +759,8 @@ async def msd_state() -> dict:
     """Virtual mass-storage state: drives (cdrom / rw partition), connected,
     stored images, storage free space."""
     _g = _msd_guard()
-    if _g: return _g
+    if _g:
+        return _g
     return await client.msd_state()
 
 
@@ -313,18 +780,28 @@ async def msd_push_files(
     (Windows shows it immediately; disconnect later with msd_disconnect).
     Without connecting, files only reach the KVM's storage."""
     _g = _msd_guard()
-    if _g: return _g
-    from .msdfat import MsdFatError, build_fat_image
+    if _g:
+        return _g
+    from .msdfat import build_fat_image
 
     os.makedirs("/tmp/glkvm-mcp-msd", exist_ok=True)
-    tmp = os.path.join("/tmp/glkvm-mcp-msd", os.path.basename(image_name) or "glkvm-mcp-files.img")
+    tmp = os.path.join(
+        "/tmp/glkvm-mcp-msd", os.path.basename(image_name) or "glkvm-mcp-files.img"
+    )
     sz, files = await build_fat_image(paths, tmp, size_mb)
     written = await client.msd_write_image(tmp, os.path.basename(image_name))
-    res = {"ok": True, "image": os.path.basename(image_name), "image_bytes": sz,
-           "uploaded": written, "files": files, "connected": None}
+    res = {
+        "ok": True,
+        "image": os.path.basename(image_name),
+        "image_bytes": sz,
+        "uploaded": written,
+        "files": files,
+        "connected": None,
+    }
     if connect_target:
-        res["connected"] = await client.msd_connect(os.path.basename(image_name),
-                                                    cdrom=False, rw=rw)
+        res["connected"] = await client.msd_connect(
+            os.path.basename(image_name), cdrom=False, rw=rw
+        )
     return res
 
 
@@ -342,26 +819,41 @@ async def msd_pull_files(
     streams the image back (lzma by default; FAT images compress hugely),
     unpacks it with 7z into out_dir, and removes the image from KVM storage."""
     _g = _msd_guard()
-    if _g: return _g
-    from .msdfat import MsdFatError, unpack_fat_image
+    if _g:
+        return _g
+    from .msdfat import unpack_fat_image
 
     image_name = os.path.basename(image_name)
-    zpath = os.path.join(out_dir, f"{image_name}.{'xz' if compress == 'lzma' else 'zst' if compress == 'zstd' else 'raw'}")
+    zpath = os.path.join(
+        out_dir,
+        f"{image_name}.{'xz' if compress == 'lzma' else 'zst' if compress == 'zstd' else 'raw'}",
+    )
     total = await client.msd_download_image(image_name, zpath, compress=compress)
     out_path = zpath.replace(".xz", "").replace(".zst", "").replace(".raw", "")
     if compress == "lzma":
         import lzma
+
         with open(zpath, "rb") as f:
             with open(out_path, "wb") as g:
                 g.write(lzma.decompress(f.read()))
         os.remove(zpath)
     elif compress == "zstd":
-        return {"ok": True, "downloaded": total, "downloaded_to": zpath,
-                "note": "zstd: run `zstd -d` yourself or pass compress='lzma'"}
+        return {
+            "ok": True,
+            "downloaded": total,
+            "downloaded_to": zpath,
+            "note": "zstd: run `zstd -d` yourself or pass compress='lzma'",
+        }
     files = await unpack_fat_image(out_path, os.path.join(out_dir, "extracted"))
     sizes = {f: os.path.getsize(f) for f in files}
-    return {"ok": True, "image_bytes": os.path.getsize(out_path), "downloaded": total,
-            "out_dir": os.path.join(out_dir, "extracted"), "files": files, "sizes": sizes}
+    return {
+        "ok": True,
+        "image_bytes": os.path.getsize(out_path),
+        "downloaded": total,
+        "out_dir": os.path.join(out_dir, "extracted"),
+        "files": files,
+        "sizes": sizes,
+    }
 
 
 @mcp.tool()
@@ -369,7 +861,8 @@ async def msd_connect(image_name: str, cdrom: bool = False, rw: bool = True) -> 
     """Attach a stored MSD image to the target as a USB disk (default rw flash)
     or CD-ROM (cdrom=True, always read-only). The target OS sees it immediately."""
     _g = _msd_guard()
-    if _g: return _g
+    if _g:
+        return _g
     return await client.msd_connect(os.path.basename(image_name), cdrom=cdrom, rw=rw)
 
 
@@ -378,7 +871,8 @@ async def msd_disconnect() -> dict:
     """Detach the virtual drive from the target (eject first on the target if
     it is rw-mounted; kvmd busy flag guards some cases)."""
     _g = _msd_guard()
-    if _g: return _g
+    if _g:
+        return _g
     return await client.msd_connect(connected=False)
 
 
@@ -386,7 +880,8 @@ async def msd_disconnect() -> dict:
 async def msd_remove_image(image_name: str) -> dict:
     """Delete an image from the KVM's MSD storage."""
     _g = _msd_guard()
-    if _g: return _g
+    if _g:
+        return _g
     await client.msd_remove(os.path.basename(image_name))
     await asyncio.sleep(1.2)
     st = await client.msd_state()
@@ -394,6 +889,23 @@ async def msd_remove_image(image_name: str) -> dict:
 
 
 # ---------------------------------------------------------------- state / helpers
+
+
+@mcp.tool()
+async def refresh_auth() -> dict[str, Any] | ToolResult:
+    """Force a fresh KVM login and report status without returning credentials."""
+    try:
+        await client.login(force=True)
+    except Exception as exc:
+        return _structured_error(
+            {
+                "ok": False,
+                "error": "KVM authentication refresh failed",
+                "failure": {"stage": "authentication", **safe_error_details(exc)},
+            }
+        )
+    return {"ok": True}
+
 
 @mcp.tool()
 async def human_activity(motion: bool = True) -> dict:
@@ -411,14 +923,20 @@ async def human_activity(motion: bool = True) -> dict:
 async def snapshot_info() -> dict:
     """Target display resolution + one fresh frame hash (cheap freshness probe)."""
     _, sha = await client.snapshot()
-    return {"ok": True, "resolution": {"width": client.resolution[0], "height": client.resolution[1]},
-            "frame_sha": sha}
+    return {
+        "ok": True,
+        "resolution": {"width": client.resolution[0], "height": client.resolution[1]},
+        "frame_sha": sha,
+    }
 
 
 @mcp.tool()
-async def kvmd_api(method: Literal["GET", "POST"], path: str,
-                   query: dict[str, Any] | None = None,
-                   data: dict[str, Any] | None = None) -> Any:
+async def kvmd_api(
+    method: Literal["GET", "POST"],
+    path: str,
+    query: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
+) -> Any:
     """Raw passthrough to the kvmd HTTP API (auth handled), e.g.
     GET /api/hid (LEDs), GET /api/hid/inactivity, GET /api/msd, /api/log ...
 
